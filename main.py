@@ -7,9 +7,13 @@ import json
 import math
 import time
 import wave
+import shutil
+import socket
 import tempfile
 import threading
 import platform
+import subprocess
+import multiprocessing
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -30,6 +34,114 @@ from text_processor import process_text
 IS_MAC = platform.system() == "Darwin"
 PASTE_KEYS = ("command", "v") if IS_MAC else ("ctrl", "v")
 
+# The macOS menu-bar icon is built directly with PyObjC (see
+# _setup_menu_bar_icon) rather than a separate event-loop library such as
+# rumps. Tkinter's Cocoa backend already creates and drives its own
+# NSApplication via root.mainloop() — a second framework also trying to run
+# that loop caused a real crash (EXC_CRASH/SIGABRT inside a Tk timer
+# callback fired while the status-bar menu was open). Attaching a plain
+# NSStatusItem to the NSApp Tk already owns avoids a second competing loop.
+PYOBJC_AVAILABLE = False
+if IS_MAC:
+    try:
+        from Foundation import NSObject
+        from AppKit import (
+            NSApp,
+            NSStatusBar,
+            NSMenu,
+            NSMenuItem,
+            NSVariableStatusItemLength,
+            NSApplicationActivationPolicyAccessory,
+        )
+        PYOBJC_AVAILABLE = True
+    except ImportError:
+        PYOBJC_AVAILABLE = False
+
+
+def _get_frontmost_bundle_id():
+    """Bundle ID of the frontmost app, via lsappinfo (a LaunchServices CLI).
+
+    Used to remember which app the user was dictating into before our own
+    overlay/window appears (see _start_recording), so it can be reactivated
+    right before pasting. Deliberately NOT using AppKit/NSWorkspace here:
+    _start_recording runs on pynput's own background listener thread (it's
+    called directly from the pynput key-down callback), and AppKit is only
+    safe to call from the main thread — mixing threads with Cocoa is
+    exactly what caused the crash documented near _setup_menu_bar_icon.
+    Shelling out to lsappinfo avoids touching AppKit from that thread
+    entirely, and unlike "tell application System Events", it doesn't
+    trigger a new Automation permission prompt.
+    """
+    if not IS_MAC:
+        return None
+    try:
+        asn = subprocess.run(
+            ["lsappinfo", "front"], capture_output=True, text=True, timeout=1.0,
+        ).stdout.strip()
+        if not asn:
+            return None
+        out = subprocess.run(
+            ["lsappinfo", "info", "-only", "bundleID", asn],
+            capture_output=True, text=True, timeout=1.0,
+        ).stdout.strip()
+        # Output looks like: "bundleID"="com.apple.TextEdit"
+        if "=" in out:
+            return out.split("=", 1)[1].strip().strip('"')
+    except Exception:
+        pass
+    return None
+
+
+def _activate_bundle(bundle_id):
+    if not IS_MAC or not bundle_id:
+        return
+    try:
+        subprocess.run(["open", "-b", bundle_id], timeout=1.0)
+    except Exception:
+        pass
+
+# ── Single-instance guard ───────────────────────────────────────────
+# Binding a localhost socket is a simple, dependency-free way to make sure
+# only one copy runs at a time. This matters for a background/menu-bar app
+# in particular: there's no window to confirm it already started, so a
+# second double-click, or a login item launching on top of a manually
+# started copy, would otherwise just pile up as another invisible process
+# instead of failing loudly.
+_SINGLE_INSTANCE_PORT = 47821
+_singleton_socket = None  # kept alive for the process lifetime
+
+
+def _acquire_single_instance_lock():
+    global _singleton_socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", _SINGLE_INSTANCE_PORT))
+        s.listen(1)
+    except OSError:
+        s.close()
+        return False
+    _singleton_socket = s
+    return True
+
+
+def _notify_already_running():
+    if IS_MAC:
+        try:
+            subprocess.run(
+                [
+                    "osascript", "-e",
+                    'display notification '
+                    '"WisprTool is already running — check the menu bar." '
+                    'with title "WisprTool"',
+                ],
+                check=False,
+            )
+        except Exception:
+            pass
+    else:
+        print("WisprTool is already running.")
+
+
 # ── Paths ───────────────────────────────────────────────────────────
 if getattr(sys, "frozen", False):
     APP_DIR = os.path.dirname(sys.executable)
@@ -37,8 +149,51 @@ else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SAMPLE_RATE = 16000
-CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 MAX_HISTORY = 100
+
+
+def _user_data_dir():
+    """Where config/history should live — deliberately NOT inside the app
+    bundle.
+
+    Writing files next to the frozen executable means writing into
+    Contents/MacOS/ on macOS, which modifies the signed .app bundle at
+    runtime. That invalidates its code signature the moment settings are
+    first saved ("a sealed resource is missing or invalid" per spctl), and
+    a broken signature is why macOS silently refuses to add the app to
+    Accessibility/Input Monitoring afterward. In dev mode (unfrozen) there's
+    no bundle to break, so keep the old next-to-script behaviour.
+    """
+    if not getattr(sys, "frozen", False):
+        return APP_DIR
+    if IS_MAC:
+        base = os.path.expanduser("~/Library/Application Support/WisprTool")
+    elif platform.system() == "Windows":
+        base = os.path.join(
+            os.environ.get("APPDATA", os.path.expanduser("~")), "WisprTool"
+        )
+    else:
+        base = os.path.expanduser("~/.wisprtool")
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+USER_DATA_DIR = _user_data_dir()
+CONFIG_PATH = os.path.join(USER_DATA_DIR, "config.json")
+
+# One-time migration: earlier builds stored config.json next to the
+# executable (inside the app bundle on macOS). Bring existing settings
+# along so this fix doesn't reset anyone's hotkey/API keys.
+_OLD_CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+if (
+    _OLD_CONFIG_PATH != CONFIG_PATH
+    and os.path.exists(_OLD_CONFIG_PATH)
+    and not os.path.exists(CONFIG_PATH)
+):
+    try:
+        shutil.copy2(_OLD_CONFIG_PATH, CONFIG_PATH)
+    except OSError:
+        pass
 
 # ── Version ────────────────────────────────────────────────────────
 # When frozen, --add-data bundles VERSION inside the temp extraction dir
@@ -717,6 +872,13 @@ class App:
             self.recording = True
             self.audio_frames = []
 
+        # Remember whatever app the user was dictating into *before* our
+        # own overlay/window appears. On macOS, showing our floating
+        # overlay can bring WisprTool itself frontmost, which otherwise
+        # makes the paste at the end land in our own app instead of the
+        # app the user was actually typing into.
+        self._target_bundle_id = _get_frontmost_bundle_id()
+
         self.stream = sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype="float32",
             callback=self._audio_cb,
@@ -808,6 +970,10 @@ class App:
                     )
 
                 # Step 3: Paste at cursor
+                # Re-activate whichever app was frontmost when recording
+                # started, in case our own overlay/window grabbed focus
+                # in the meantime (see _start_recording).
+                _activate_bundle(getattr(self, "_target_bundle_id", None))
                 time.sleep(0.15)
                 old_clip = pyperclip.paste()
                 pyperclip.copy(text)
@@ -889,14 +1055,118 @@ class App:
     # ── Lifecycle ────────────────────────────────────────────────────
 
     def _on_close(self):
+        # With a menu-bar icon running, closing the window should hide it,
+        # not quit the app — the app keeps running in the background.
+        if getattr(self, "_menu_bar_active", False):
+            self.root.withdraw()
+        else:
+            self._shutdown()
+
+    def _shutdown(self):
         self._save_ai_config()
         self.listener.stop()
         self.root.destroy()
 
+    def show_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
     def run(self):
+        self._menu_bar_active = False
+        if IS_MAC and PYOBJC_AVAILABLE:
+            try:
+                self._setup_menu_bar_icon()
+                self._menu_bar_active = True
+            except Exception as e:
+                # Don't let a native-UI hiccup leave the user with an
+                # invisible, unreachable app — fall back to a normal window.
+                print(f"Menu bar icon setup failed, showing window instead: {e}")
+                self.root.deiconify()
         self.root.mainloop()
+
+    def _setup_menu_bar_icon(self):
+        """Add a macOS status-bar icon via PyObjC, on Tk's own run loop.
+
+        No second event-loop library is started here (see the PYOBJC_AVAILABLE
+        comment near the top of this file for why that broke). This just adds
+        a status item + menu to the NSApplication Tkinter already created and
+        will drive itself via root.mainloop() — there is exactly one loop.
+        """
+        # Tk's own Cocoa setup puts the app's activation policy back to
+        # "Regular" (i.e. a Dock icon), overriding whatever LSUIElement set
+        # in Info.plist at launch. Force it back to "Accessory" now that
+        # Tk has finished creating its NSApp, or the Dock icon reappears
+        # despite the plist being correct.
+        NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+
+        app_ref = self
+
+        class _MenuTarget(NSObject):
+            def showWindow_(self, _sender):
+                app_ref.show_window()
+
+            def quitApp_(self, _sender):
+                app_ref._shutdown()
+
+        # Keep strong references for the process lifetime. PyObjC objects
+        # with no surviving Python reference can be garbage collected,
+        # which would silently make the status item or menu stop working.
+        self._menu_target = _MenuTarget.alloc().init()
+
+        status_bar = NSStatusBar.systemStatusBar()
+        self._status_item = status_bar.statusItemWithLength_(NSVariableStatusItemLength)
+        self._status_item.button().setTitle_("🎙")
+
+        menu = NSMenu.alloc().init()
+
+        show_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Show WisprTool", "showWindow:", ""
+        )
+        show_item.setTarget_(self._menu_target)
+        menu.addItem_(show_item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Quit WisprTool", "quitApp:", ""
+        )
+        quit_item.setTarget_(self._menu_target)
+        menu.addItem_(quit_item)
+
+        self._status_menu = menu  # keep alive alongside self._status_item
+        self._status_item.setMenu_(menu)
+
+        try:
+            subprocess.run(
+                [
+                    "osascript", "-e",
+                    'display notification '
+                    '"Running in the menu bar — click the mic icon to open it." '
+                    'with title "WisprTool"',
+                ],
+                check=False,
+            )
+        except Exception:
+            pass  # notifications aren't essential; never block startup on them
+
+        # Start hidden: this is a background/menu-bar app, so the main
+        # window only appears when the user picks "Show WisprTool".
+        self.root.withdraw()
 
 
 if __name__ == "__main__":
+    # Required for any frozen (PyInstaller) app that might spawn subprocesses
+    # via multiprocessing — without this, a child re-executing the frozen
+    # binary would re-run this whole script (including relaunching the GUI)
+    # instead of just running the worker function, which can spiral into
+    # runaway processes. Cheap to call even if nothing currently uses
+    # multiprocessing directly.
+    multiprocessing.freeze_support()
+
+    if not _acquire_single_instance_lock():
+        _notify_already_running()
+        sys.exit(0)
+
     app = App()
     app.run()

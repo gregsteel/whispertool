@@ -5,42 +5,25 @@ echo "============================================"
 echo
 
 pip3 install pyinstaller >/dev/null 2>&1
+pip3 install -r requirements.txt >/dev/null 2>&1
 
-pyinstaller --onefile --noconsole --name WisprTool \
-    --add-data "VERSION:." \
-    --hidden-import=pynput.keyboard._darwin \
-    --hidden-import=pynput.mouse._darwin \
-    --collect-all ctranslate2 \
-    --collect-all faster_whisper \
-    --collect-all onnxruntime \
-    --exclude-module torch \
-    --exclude-module torchaudio \
-    --exclude-module torchvision \
-    --exclude-module matplotlib \
-    --exclude-module pandas \
-    --exclude-module numba \
-    --exclude-module llvmlite \
-    --exclude-module scipy \
-    --exclude-module tensorflow \
-    --exclude-module tensorboard \
-    --exclude-module openpyxl \
-    --exclude-module PIL \
-    --exclude-module cv2 \
-    --exclude-module sklearn \
-    --exclude-module jupyter \
-    --exclude-module notebook \
-    --exclude-module pytest \
-    main.py
+# Build from WisprTool.spec, which is the single source of truth for the
+# macOS bundle (onedir layout, menu-bar/LSUIElement + mic usage Info.plist
+# keys). Keep spec changes there rather than duplicating flags here.
+pyinstaller WisprTool.spec
 
 echo
-if [ -f "dist/WisprTool" ]; then
+if [ -d "dist/WisprTool.app" ]; then
     echo "============================================"
     echo "  SUCCESS! Find your app at:"
-    echo "  dist/WisprTool"
+    echo "  dist/WisprTool.app"
     echo "============================================"
     echo
     echo "  On Mac: grant Accessibility permissions"
-    echo "  System Settings > Privacy > Accessibility"
+    echo "  System Settings > Privacy & Security > Accessibility"
+    echo
+    echo "  WisprTool now runs as a menu-bar app (no Dock icon,"
+    echo "  no window) - look for the mic icon in the menu bar."
 else
     echo "  BUILD FAILED - check errors above."
 fi

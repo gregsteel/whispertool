@@ -4,3 +4,4 @@ numpy
 pynput
 pyperclip
 pyautogui
+pyobjc-framework-Cocoa; sys_platform == "darwin"
