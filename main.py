@@ -6,6 +6,7 @@ import sys
 import json
 import math
 import time
+import ctypes
 import wave
 import shutil
 import socket
@@ -42,6 +43,7 @@ PASTE_KEYS = ("command", "v") if IS_MAC else ("ctrl", "v")
 # callback fired while the status-bar menu was open). Attaching a plain
 # NSStatusItem to the NSApp Tk already owns avoids a second competing loop.
 PYOBJC_AVAILABLE = False
+QUARTZ_AVAILABLE = False
 if IS_MAC:
     try:
         from Foundation import NSObject
@@ -56,6 +58,22 @@ if IS_MAC:
         PYOBJC_AVAILABLE = True
     except ImportError:
         PYOBJC_AVAILABLE = False
+    try:
+        from Quartz import (
+            CGEventCreateKeyboardEvent,
+            CGEventPost,
+            CGEventSetFlags,
+            kCGHIDEventTap,
+            kCGEventFlagMaskCommand,
+        )
+        QUARTZ_AVAILABLE = True
+    except ImportError:
+        QUARTZ_AVAILABLE = False
+
+# Hardware keycode for the letter V on a US / ANSI keyboard. Used by the
+# Quartz paste path below. Modifier combos (Cmd+V) don't depend on layout
+# for this keycode on macOS.
+_KEYCODE_V = 9
 
 
 def _get_frontmost_bundle_id():
@@ -98,7 +116,169 @@ def _activate_bundle(bundle_id):
     try:
         subprocess.run(["open", "-b", bundle_id], timeout=1.0)
     except Exception:
-        pass
+        return
+    # 'open -b' is asynchronous — it returns before macOS has actually
+    # switched the frontmost app.  Poll lsappinfo until the target is
+    # confirmed frontmost (up to 600 ms) so that the Cmd+V paste that
+    # follows always lands in the right window instead of WisprTool.
+    deadline = time.time() + 0.6
+    while time.time() < deadline:
+        try:
+            if _get_frontmost_bundle_id() == bundle_id:
+                time.sleep(0.05)  # small settle buffer after focus arrives
+                return
+        except Exception:
+            break
+        time.sleep(0.05)
+
+
+# ── macOS permission checks ─────────────────────────────────────────
+# Everything this app does that can fail *silently* on macOS traces back
+# to a missing privacy permission:
+#   - Accessibility: pyautogui's synthetic Cmd+V goes nowhere without it,
+#     and pynput may not see global key events.
+#   - Input Monitoring: required on macOS 10.15+ for pynput's global
+#     keyboard listener (the hotkey simply never fires without it).
+#   - Microphone: recording returns silence / errors without it.
+# These checks let the app tell the user exactly what is wrong at startup
+# instead of appearing to work but pasting nothing.
+
+MAC_SETTINGS_PANES = {
+    "Accessibility":
+        "x-apple.systempreferences:com.apple.preference.security"
+        "?Privacy_Accessibility",
+    "Input Monitoring":
+        "x-apple.systempreferences:com.apple.preference.security"
+        "?Privacy_ListenEvent",
+    "Microphone":
+        "x-apple.systempreferences:com.apple.preference.security"
+        "?Privacy_Microphone",
+}
+
+
+def _check_accessibility():
+    """True/False, or None if the check itself failed."""
+    try:
+        appsvc = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework"
+            "/ApplicationServices"
+        )
+        appsvc.AXIsProcessTrusted.restype = ctypes.c_bool
+        return bool(appsvc.AXIsProcessTrusted())
+    except Exception:
+        return None
+
+
+def _check_input_monitoring():
+    """True/False/None. Uses IOHIDCheckAccess (macOS 10.15+)."""
+    try:
+        iokit = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/IOKit.framework/IOKit"
+        )
+        # kIOHIDRequestTypeListenEvent = 1;
+        # returns kIOHIDAccessTypeGranted=0, Denied=1, Unknown=2
+        iokit.IOHIDCheckAccess.restype = ctypes.c_uint32
+        iokit.IOHIDCheckAccess.argtypes = [ctypes.c_uint32]
+        status = iokit.IOHIDCheckAccess(1)
+        if status == 0:
+            return True
+        if status == 1:
+            return False
+        return None  # not yet determined — macOS will prompt on first use
+    except Exception:
+        return None
+
+
+def _check_microphone():
+    """True/False/None for the audio path this app actually uses.
+
+    WisprTool records via PortAudio (sounddevice), NOT AVFoundation.
+    TCC can therefore show WisprTool ON in System Settings while
+    AVCaptureDevice still reports "not determined" — that mismatch is
+    what made the panel flash amber falsely. Prefer a short PortAudio
+    open; fall back to AVFoundation only when the probe fails oddly.
+    """
+    # Prefer the real capture stack this app uses.
+    try:
+        devices = sd.query_devices()
+        if not any(d.get("max_input_channels", 0) > 0 for d in devices):
+            return False
+        with sd.InputStream(
+            samplerate=16000, channels=1, dtype="float32",
+            blocksize=512,
+        ):
+            pass
+        return True
+    except Exception as e:
+        err = str(e).lower()
+        # Explicit denial from CoreAudio / PortAudio
+        if any(s in err for s in (
+            "permission", "denied", "not authorized", "errauthorization",
+            "-10851",  # kAudioHardwareBadDeviceError-ish; treat carefully
+        )):
+            return False
+        # Fall through to AVFoundation for a second opinion.
+
+    if not PYOBJC_AVAILABLE:
+        return None
+    try:
+        import objc
+        objc.loadBundle(
+            "AVFoundation", {},
+            bundle_path="/System/Library/Frameworks/AVFoundation.framework",
+        )
+        AVCaptureDevice = objc.lookUpClass("AVCaptureDevice")
+        # AVMediaTypeAudio == "soun"; statuses: 0 notDetermined,
+        # 1 restricted, 2 denied, 3 authorized
+        status = AVCaptureDevice.authorizationStatusForMediaType_("soun")
+        if status == 3:
+            return True
+        if status in (1, 2):
+            return False
+        return None  # not yet determined — macOS will prompt on first use
+    except Exception:
+        return None
+
+
+def _paste_via_cmd_v():
+    """Inject Cmd+V into the frontmost app.
+
+    Prefer Quartz CGEvent on macOS — it posts HID-level key events that
+    survive focus races better than pyautogui's higher-level synthesis.
+    Falls back to pyautogui everywhere else (and on Mac if Quartz is
+    missing).
+    """
+    if IS_MAC and QUARTZ_AVAILABLE:
+        down = CGEventCreateKeyboardEvent(None, _KEYCODE_V, True)
+        up = CGEventCreateKeyboardEvent(None, _KEYCODE_V, False)
+        CGEventSetFlags(down, kCGEventFlagMaskCommand)
+        CGEventSetFlags(up, kCGEventFlagMaskCommand)
+        CGEventPost(kCGHIDEventTap, down)
+        time.sleep(0.02)
+        CGEventPost(kCGHIDEventTap, up)
+        return
+    pyautogui.hotkey(*PASTE_KEYS, interval=0.02)
+
+
+def check_mac_permissions():
+    """Dict of {name: True|False|None} for each required permission."""
+    if not IS_MAC:
+        return {}
+    return {
+        "Accessibility": _check_accessibility(),
+        "Input Monitoring": _check_input_monitoring(),
+        "Microphone": _check_microphone(),
+    }
+
+
+def open_settings_pane(pane_name):
+    url = MAC_SETTINGS_PANES.get(pane_name)
+    if url:
+        try:
+            subprocess.run(["open", url], check=False)
+        except Exception:
+            pass
+
 
 # ── Single-instance guard ───────────────────────────────────────────
 # Binding a localhost socket is a simple, dependency-free way to make sure
@@ -575,6 +755,10 @@ class App:
         self._build_ui()
         self.overlay = FloatingOverlay(self.root)
 
+        # Verify macOS privacy permissions up front so missing ones are
+        # reported clearly instead of silently breaking hotkey/paste.
+        self._perms_ok = self._refresh_permissions()
+
         # Load model in background
         threading.Thread(target=self._load_model, daemon=True).start()
 
@@ -604,6 +788,46 @@ class App:
         self.status_dot.create_oval(2, 2, 12, 12, fill="gray", tags="dot")
         ttk.Label(row, textvariable=self.status_var,
                   font=("", 10)).pack(side="left", padx=8)
+
+        # ── System permissions (macOS only) ──────────────────────────
+        if IS_MAC:
+            pf = ttk.LabelFrame(self.root, text="System Permissions")
+            pf.pack(fill="x", padx=px, pady=py)
+            self._perm_rows = {}
+            perm_help = {
+                "Accessibility":
+                    "needed to paste text into other apps",
+                "Input Monitoring":
+                    "needed to detect the hotkey globally",
+                "Microphone":
+                    "needed to record your voice",
+            }
+            for name in MAC_SETTINGS_PANES:
+                prow = ttk.Frame(pf)
+                prow.pack(fill="x", padx=ipx, pady=2)
+                dot = tk.Canvas(prow, width=14, height=14,
+                                highlightthickness=0)
+                dot.pack(side="left")
+                dot.create_oval(2, 2, 12, 12, fill="gray", tags="dot")
+                var = tk.StringVar(value=f"{name} — checking...")
+                ttk.Label(prow, textvariable=var).pack(side="left", padx=8)
+                btn = ttk.Button(
+                    prow, text="Open Settings",
+                    command=lambda n=name: open_settings_pane(n),
+                )
+                # Button is packed/unpacked by _refresh_permissions
+                self._perm_rows[name] = (dot, var, btn, perm_help[name])
+            brow = ttk.Frame(pf)
+            brow.pack(fill="x", padx=ipx, pady=(4, 8))
+            ttk.Button(
+                brow, text="Re-check Permissions",
+                command=self._refresh_permissions,
+            ).pack(side="left")
+            self._perm_hint_var = tk.StringVar(value="")
+            ttk.Label(
+                pf, textvariable=self._perm_hint_var,
+                foreground="#b91c1c", wraplength=800, justify="left",
+            ).pack(anchor="w", padx=ipx, pady=(0, 8))
 
         # ── Hotkey ───────────────────────────────────────────────────
         hf = ttk.LabelFrame(self.root, text="Hotkey (hold to record)")
@@ -879,6 +1103,18 @@ class App:
         # app the user was actually typing into.
         self._target_bundle_id = _get_frontmost_bundle_id()
 
+        # The overlay is shown ~30 ms from now (next _tick call).
+        # Showing any new Tkinter window on macOS can steal focus from
+        # the target app.  Schedule a non-blocking re-activation from the
+        # main thread so focus returns to the target shortly after the
+        # overlay appears, before the user has finished speaking.
+        if IS_MAC and self._target_bundle_id:
+            _tgt = self._target_bundle_id
+            self.root.after(
+                150,
+                lambda: subprocess.Popen(["open", "-b", _tgt]),
+            )
+
         self.stream = sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype="float32",
             callback=self._audio_cb,
@@ -970,16 +1206,82 @@ class App:
                     )
 
                 # Step 3: Paste at cursor
-                # Re-activate whichever app was frontmost when recording
-                # started, in case our own overlay/window grabbed focus
-                # in the meantime (see _start_recording).
-                _activate_bundle(getattr(self, "_target_bundle_id", None))
-                time.sleep(0.15)
-                old_clip = pyperclip.paste()
+                #
+                # (a) Wait until the user's hotkey modifiers are fully
+                # released. The synthetic Cmd+V below merges with any
+                # physically-held modifier (Ctrl+Cmd+V etc.), which most
+                # apps ignore — a major cause of intermittent pastes when
+                # transcription finishes quickly.
+                deadline = time.time() + 2.0
+                while self.pressed_keys and time.time() < deadline:
+                    time.sleep(0.02)
+
+                # (b) Hide our overlay *before* reactivating the target.
+                # A visible Toplevel on macOS keeps WisprTool eligible to
+                # receive the paste; withdrawing it first makes the
+                # subsequent app switch stick reliably.
+                self.overlay.request_hide()
+                time.sleep(0.12)
+
+                # (c) Re-activate whichever app was frontmost when
+                # recording started. _activate_bundle polls until the
+                # switch is confirmed.
+                target = getattr(self, "_target_bundle_id", None)
+                _activate_bundle(target)
+                # Never paste into ourselves. If reactivation failed and
+                # we are still frontmost, abort rather than dumping text
+                # into the GUI history/console area.
+                if IS_MAC and target:
+                    front = _get_frontmost_bundle_id()
+                    if front != target:
+                        _activate_bundle(target)
+                        front = _get_frontmost_bundle_id()
+                    still_us = (
+                        front == "com.futurminds.wisprtool"
+                        or (
+                            front
+                            and front != target
+                            and "python" in front.lower()
+                        )
+                    )
+                    if still_us:
+                        print(
+                            f"[!] Paste aborted: still frontmost "
+                            f"({front!r}); wanted {target!r}"
+                        )
+                        self._pending_history = text
+                        return
+
+                # (d) Put the text on the clipboard and verify it landed.
+                # pyperclip shells out to pbcopy on macOS, so the copy is
+                # not instant; pasting before it completes sends the OLD
+                # clipboard contents.
+                try:
+                    old_clip = pyperclip.paste()
+                except Exception:
+                    old_clip = None
                 pyperclip.copy(text)
-                pyautogui.hotkey(*PASTE_KEYS)
-                time.sleep(0.05)
-                pyperclip.copy(old_clip)
+                deadline = time.time() + 1.0
+                while time.time() < deadline:
+                    try:
+                        if pyperclip.paste() == text:
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.03)
+
+                _paste_via_cmd_v()
+
+                # (e) The target app reads the pasteboard asynchronously,
+                # typically well after the keystroke is delivered.
+                # Restoring the old clipboard too early made the paste
+                # silently produce stale contents or nothing at all.
+                time.sleep(0.6)
+                if old_clip is not None:
+                    try:
+                        pyperclip.copy(old_clip)
+                    except Exception:
+                        pass
 
                 self._pending_history = text
 
@@ -1052,6 +1354,48 @@ class App:
         self.overlay.tick()
         self.root.after(30, self._tick)
 
+    # ── Permissions ──────────────────────────────────────────────────
+
+    def _refresh_permissions(self):
+        """Check macOS privacy permissions and update the panel.
+
+        Returns True when everything needed is granted."""
+        if not IS_MAC:
+            return True
+        results = check_mac_permissions()
+        all_ok = True
+        for name, (dot, var, btn, help_txt) in self._perm_rows.items():
+            status = results.get(name)
+            dot.delete("dot")
+            if status is True:
+                colour = "#22c55e"
+                var.set(f"{name}: granted")
+                btn.pack_forget()
+            elif status is False:
+                colour = "#ef4444"
+                var.set(f"{name}: NOT GRANTED — {help_txt}")
+                btn.pack(side="right")
+                all_ok = False
+            else:
+                colour = "#f59e0b"
+                var.set(
+                    f"{name}: not determined — {help_txt} "
+                    "(macOS should prompt on first use)"
+                )
+                btn.pack(side="right")
+            dot.create_oval(2, 2, 12, 12, fill=colour, tags="dot")
+        if all_ok:
+            self._perm_hint_var.set("")
+        else:
+            self._perm_hint_var.set(
+                "Some permissions are missing, so recording or pasting "
+                "will fail. Click Open Settings, add/enable the app shown "
+                "there (when run from source this is usually Terminal or "
+                "python3), then QUIT and RESTART WisprTool — macOS only "
+                "applies these permissions at launch."
+            )
+        return all_ok
+
     # ── Lifecycle ────────────────────────────────────────────────────
 
     def _on_close(self):
@@ -1083,6 +1427,12 @@ class App:
                 # invisible, unreachable app — fall back to a normal window.
                 print(f"Menu bar icon setup failed, showing window instead: {e}")
                 self.root.deiconify()
+        # If any required macOS permission is missing, keep the window
+        # visible so the user sees the permissions panel instead of the
+        # app silently hiding in the menu bar and appearing broken.
+        if IS_MAC and not getattr(self, "_perms_ok", True):
+            self.root.deiconify()
+            self.root.lift()
         self.root.mainloop()
 
     def _setup_menu_bar_icon(self):

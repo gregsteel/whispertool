@@ -5,3 +5,4 @@ pynput
 pyperclip
 pyautogui
 pyobjc-framework-Cocoa; sys_platform == "darwin"
+pyobjc-framework-Quartz; sys_platform == "darwin"
